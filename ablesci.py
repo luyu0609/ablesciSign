@@ -14,6 +14,7 @@ AbleSci自动签到脚本
 
 import os
 import sys
+import re
 import time
 import requests
 from bs4 import BeautifulSoup
@@ -331,6 +332,9 @@ class AbleSciAuto:
                     csrf_input = soup.find('input', {'name': '_csrf'})
                     if csrf_input and csrf_input.get('value'):
                         return csrf_input['value']
+                    match = re.search(r"'_csrf':\s*'([^']+)'", response.text)
+                    if match:
+                        return match.group(1)
             except Exception:
                 continue
         return ''
