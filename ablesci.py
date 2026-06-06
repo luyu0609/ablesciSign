@@ -318,14 +318,39 @@ class AbleSciAuto:
             self.log(f"获取用户信息时出错: {str(e)}", "error")
         return False
 
+    def get_csrf_token_from_page(self):
+        """从已登录页面获取CSRF令牌"""
+        for url in ["https://www.ablesci.com/", "https://www.ablesci.com/my/info"]:
+            try:
+                response = self.session.get(url, headers=self.headers, timeout=30)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    meta = soup.find('meta', {'name': 'csrf-token'})
+                    if meta and meta.get('content'):
+                        return meta['content']
+                    csrf_input = soup.find('input', {'name': '_csrf'})
+                    if csrf_input and csrf_input.get('value'):
+                        return csrf_input['value']
+            except Exception:
+                continue
+        return ''
+
     def sign_in(self):
         """执行签到操作 - 处理已签到情况"""
         sign_url = "https://www.ablesci.com/user/sign"
         headers = self.headers.copy()
         headers["Referer"] = "https://www.ablesci.com/"
+        headers["X-Requested-With"] = "XMLHttpRequest"
         
         try:
-            response = self.session.get(sign_url, headers=headers, timeout=30)
+            csrf_token = self.get_csrf_token_from_page()
+            if csrf_token:
+                data = {"_csrf": csrf_token}
+                response = self.session.post(sign_url, data=data, headers=headers, timeout=30)
+            else:
+                self.log("未获取到CSRF令牌，尝试GET方式签到", "warning")
+                response = self.session.get(sign_url, headers=headers, timeout=30)
+            
             if response.status_code == 200:
                 try:
                     result = response.json()
