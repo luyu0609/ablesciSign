@@ -498,7 +498,10 @@ def main():
         global_notifier.send_notification()
     
     if os.getenv("GITHUB_ACTIONS") == "true":
-        print(f"::set-output name=log_content::{global_notifier.get_content()}")
+        github_output = os.getenv("GITHUB_OUTPUT")
+        if github_output:
+            with open(github_output, "a", encoding="utf-8") as f:
+                f.write(f"log_content<<EOF\n{global_notifier.get_content()}\nEOF\n")
 
 if __name__ == "__main__":
     main()
