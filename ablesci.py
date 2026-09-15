@@ -9,6 +9,7 @@ AbleSci自动签到脚本
 更新日期：2025年9月2日 >> 修复日志输出时间为北京时间 ; 修复签到前后用户信息显示 ; 优化登录失败处理 ; 优化签到已签到处理
 更新日期：2025年9月3日 >> 保护隐私，不在日志中显示完整邮箱和用户名
 更新日期：2026年3月22日 >> 支持本地.env文件; 使用zoneinfo/pytz处理时区; 统一通知器; 修复zoneinfo时区查找失败问题,增加回退机制; 修复已签到处理逻辑; 
+更新日期：2026年9月15日 >> 适配科研通2026-09-14新版CSRF机制（令牌改由<meta name="csrf-token">提供，表单内为JS填充的空占位input）; 支持令牌轮换回写; 支持X-CSRF-Token请求头; 新增ABLESCI_COOKIE免登录模式; 优化风控与验证码场景的错误提示
 作者：daitcl
 """
 
@@ -32,6 +33,7 @@ except ImportError:
 
 # 环境变量名常量
 ENV_ACCOUNTS = "ABLESCI_ACCOUNTS"
+ENV_COOKIE = "ABLESCI_COOKIE"
 
 def load_env_file():
     """
@@ -192,9 +194,14 @@ class AbleSciAuto:
         self.username = None
         self.points = None
         self.sign_days = None
+        self.csrf_param = "_csrf"
+        self.csrf_token = ""
         self.notifier = notifier if notifier else Notifier()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Origin": "https://www.ablesci.com",
             "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": "\"Windows\"",
@@ -207,25 +214,69 @@ class AbleSciAuto:
     def log(self, message, level="info"):
         """代理日志到通知系统"""
         self.notifier.log(message, level)
-        
+
+    def _request_headers(self, referer=None, ajax=True):
+        """
+        构造请求头。
+        新版登录页对页面GET比较敏感，非AJAX的页面请求不带 X-Requested-With。
+        """
+        headers = self.headers.copy()
+        if not ajax:
+            headers.pop("X-Requested-With", None)
+        if referer:
+            headers["Referer"] = referer
+        return headers
+
+    @staticmethod
+    def _parse_csrf(html):
+        """
+        从HTML中解析CSRF令牌，返回 (参数名, 令牌)。
+        科研通2026-09-14改版后，登录表单里的 _csrf input 变成由前端JS填充的空占位
+        （<input type="hidden" data-csrf-field id="login2-csrf">），
+        真实令牌改放在 <meta name="csrf-token"> 中，因此这里以 meta 为优先。
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        meta = soup.find('meta', {'name': 'csrf-token'})
+        if meta and meta.get('content'):
+            param_tag = soup.find('meta', {'name': 'csrf-param'})
+            param = param_tag.get('content') if param_tag and param_tag.get('content') else '_csrf'
+            return param, meta['content']
+        csrf_input = soup.find('input', {'name': '_csrf'})
+        if csrf_input and csrf_input.get('value'):
+            return '_csrf', csrf_input['value']
+        match = re.search(r"['\"]_csrf['\"]\s*:\s*['\"]([^'\"]+)['\"]", html)
+        if match:
+            return '_csrf', match.group(1)
+        return '_csrf', ''
+
+    def _fetch_page_csrf(self, url, referer=None):
+        """访问页面并解析CSRF令牌，同时把最新令牌回写到 self.csrf_token"""
+        try:
+            response = self.session.get(url, headers=self._request_headers(referer, ajax=False), timeout=30)
+            if response.status_code == 200:
+                param, csrf_token = self._parse_csrf(response.text)
+                if csrf_token:
+                    self.csrf_param, self.csrf_token = param, csrf_token
+                    return csrf_token
+                # 取不到令牌基本等价于命中了风控页/拦截页，输出片段便于定位
+                self.log(f"页面未包含CSRF令牌: {url}（返回长度 {len(response.text)}）", "error")
+                self.log(f"页面片段: {response.text.strip()[:200]}", "warning")
+            else:
+                self.log(f"获取页面失败 {url}，状态码: {response.status_code}", "error")
+        except Exception as e:
+            self.log(f"获取页面时出错 {url}: {str(e)}", "error")
+        return ''
+
     def get_csrf_token(self):
         """获取CSRF令牌"""
-        login_url = "https://www.ablesci.com/site/login"
-        try:
-            response = self.session.get(login_url, headers=self.headers, timeout=30)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                csrf_token = soup.find('input', {'name': '_csrf'})
-                if csrf_token:
-                    return csrf_token.get('value', '')
-            else:
-                self.log(f"获取CSRF令牌失败，状态码: {response.status_code}", "error")
-        except Exception as e:
-            self.log(f"获取CSRF令牌时出错: {str(e)}", "error")
-        return ''
+        return self._fetch_page_csrf("https://www.ablesci.com/site/login", referer="https://www.ablesci.com/site/login")
 
     def login(self):
         """执行登录操作"""
+        if os.getenv(ENV_COOKIE):
+            # Cookie免登录模式由 run() 统一处理
+            return False
+
         if not self.email or not self.password:
             self.log("邮箱或密码为空", "error")
             return False
@@ -235,10 +286,13 @@ class AbleSciAuto:
         
         if not csrf_token:
             self.log("无法获取CSRF令牌", "error")
+            self.log("若日志显示页面返回异常，请检查网络出口是否被站点风控拦截", "warning")
             return False
         
+        self.log("已获取CSRF令牌", "success")
+        
         login_data = {
-            "_csrf": csrf_token,
+            self.csrf_param: csrf_token,
             "email": self.email,
             "password": self.password,
             "remember": "off"
@@ -247,6 +301,7 @@ class AbleSciAuto:
         headers = self.headers.copy()
         headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
         headers["Referer"] = "https://www.ablesci.com/site/login"
+        headers["X-CSRF-Token"] = csrf_token
         
         try:
             response = self.session.post(
@@ -259,11 +314,17 @@ class AbleSciAuto:
             if response.status_code == 200:
                 try:
                     result = response.json()
+                    # 服务端每次响应都会轮换令牌，保存下来供后续请求使用
+                    rotated = (result.get("data") or {}).get("csrf")
+                    if rotated:
+                        self.csrf_token = rotated
                     if result.get("code") == 0:
                         self.log(f"登录成功: {result.get('msg')}", "success")
                         return True
                     else:
                         self.log(f"登录失败: {result.get('msg')}", "error")
+                        if "验证" in str(result.get('msg', '')):
+                            self.log("站点要求图片验证码，建议改用 " + ENV_COOKIE + " 免登录模式，或改在本机/青龙面板运行", "warning")
                 except json.JSONDecodeError:
                     if "退出" in response.text:
                         self.log("登录成功", "success")
@@ -276,11 +337,31 @@ class AbleSciAuto:
             self.log(f"登录过程中出错: {str(e)}", "error")
         return False
 
+    def login_by_cookie(self):
+        """Cookie免登录：直接注入浏览器Cookie，跳过账号密码登录"""
+        cookie_str = os.getenv(ENV_COOKIE, "").strip()
+        if not cookie_str:
+            return False
+        
+        count = 0
+        for pair in cookie_str.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            key, value = pair.split("=", 1)
+            self.session.cookies.set(key.strip(), value.strip(), domain=".ablesci.com", path="/")
+            count += 1
+        
+        if not count:
+            return False
+        
+        self.log(f"已注入 {count} 个Cookie，尝试免登录", "info")
+        return True
+
     def get_user_info(self):
         """获取用户信息（包括用户名、积分和签到天数）"""
         home_url = "https://www.ablesci.com/"
-        headers = self.headers.copy()
-        headers["Referer"] = "https://www.ablesci.com/"
+        headers = self._request_headers("https://www.ablesci.com/", ajax=False)
         
         try:
             response = self.session.get(home_url, headers=headers, timeout=30)
@@ -321,23 +402,12 @@ class AbleSciAuto:
 
     def get_csrf_token_from_page(self):
         """从已登录页面获取CSRF令牌"""
-        for url in ["https://www.ablesci.com/", "https://www.ablesci.com/my/info"]:
-            try:
-                response = self.session.get(url, headers=self.headers, timeout=30)
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    meta = soup.find('meta', {'name': 'csrf-token'})
-                    if meta and meta.get('content'):
-                        return meta['content']
-                    csrf_input = soup.find('input', {'name': '_csrf'})
-                    if csrf_input and csrf_input.get('value'):
-                        return csrf_input['value']
-                    match = re.search(r"'_csrf':\s*'([^']+)'", response.text)
-                    if match:
-                        return match.group(1)
-            except Exception:
-                continue
-        return ''
+        for url in ["https://www.ablesci.com/", "https://www.ablesci.com/my/info", "https://www.ablesci.com/site/login"]:
+            csrf_token = self._fetch_page_csrf(url, referer="https://www.ablesci.com/")
+            if csrf_token:
+                return csrf_token
+        # 兜底：Yii2 自带的 _csrf Cookie
+        return self.session.cookies.get('_csrf', '') or ''
 
     def sign_in(self):
         """执行签到操作 - 处理已签到情况"""
@@ -349,7 +419,8 @@ class AbleSciAuto:
         try:
             csrf_token = self.get_csrf_token_from_page()
             if csrf_token:
-                data = {"_csrf": csrf_token}
+                headers["X-CSRF-Token"] = csrf_token
+                data = {self.csrf_param: csrf_token}
                 response = self.session.post(sign_url, data=data, headers=headers, timeout=30)
             else:
                 self.log("未获取到CSRF令牌，尝试GET方式签到", "warning")
@@ -358,6 +429,9 @@ class AbleSciAuto:
             if response.status_code == 200:
                 try:
                     result = response.json()
+                    rotated = (result.get("data") or {}).get("csrf")
+                    if rotated:
+                        self.csrf_token = rotated
                     if result.get("code") == 0:
                         msg = result.get("msg", "").replace("签到成功，", "", 1)
                         self.log(f"签到成功: {result.get('msg')}", "success")
@@ -405,17 +479,25 @@ class AbleSciAuto:
 
     def run(self):
         """执行完整的登录和签到流程"""
-        if self.login():
+        if os.getenv(ENV_COOKIE) and self.login_by_cookie():
+            if not self.get_user_info():
+                self.log("Cookie无效或已过期，请重新抓取浏览器Cookie", "error")
+                return self.notifier.get_content()
+            self.log("Cookie免登录生效", "success")
+        elif self.login():
             self.get_user_info()
-            self.display_summary(is_before_sign=True)
-            
-            sign_result = self.sign_in()
-            
-            if sign_result:
-                self.log("签到完成，刷新用户信息...", "info")
-                time.sleep(2)
-                self.get_user_info()
-                self.display_summary(is_before_sign=False)
+        else:
+            return self.notifier.get_content()
+        
+        self.display_summary(is_before_sign=True)
+        
+        sign_result = self.sign_in()
+        
+        if sign_result:
+            self.log("签到完成，刷新用户信息...", "info")
+            time.sleep(2)
+            self.get_user_info()
+            self.display_summary(is_before_sign=False)
         
         return self.notifier.get_content()
 
@@ -472,7 +554,12 @@ def main():
     global_notifier = Notifier("科研通多账号签到")
     global_notifier.log("科研通多账号签到任务开始", "info")
     
-    accounts = get_accounts()
+    if os.getenv(ENV_COOKIE):
+        # Cookie免登录模式只处理单个账号
+        accounts = [("", "")]
+    else:
+        accounts = get_accounts()
+    
     account_count = len(accounts)
     
     if account_count == 0:
