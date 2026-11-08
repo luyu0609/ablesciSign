@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '40 13,23 * * *'  # UTC时间(北京时间为21:40和次日7:40)
 
+permissions:
+  contents: write   # 末尾的保活步骤需要提交，签到本身只读
+
 jobs:
   sign:
     runs-on: ubuntu-latest
@@ -42,3 +45,26 @@ jobs:
       - name: Display Log
         run: |
           echo "$LOG_CONTENT"
+
+      # 兜底保活：签到每天跑两次，由它兜住"60 天无提交即禁用定时任务"这条规则。
+      # 与 keepalive.yml 互为备份；保活失败不影响签到结论，因此 continue-on-error。
+      - name: Keepalive（距上次提交超过 20 天才更新）
+        continue-on-error: true
+        env:
+          THRESHOLD: 20
+        run: |
+          set -eu
+          last=$(git log -1 --format=%ct)
+          days=$(( ($(date +%s) - last) / 86400 ))
+          echo "距上次提交 ${days} 天（阈值 ${THRESHOLD} 天）"
+          if [ "$days" -lt "${THRESHOLD}" ]; then
+            echo "未超过阈值，跳过"
+            exit 0
+          fi
+          mkdir -p .github
+          printf 'Last sign keepalive: %s\n' "$(date -u '+%F %T UTC')" > .github/last-keepalive.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/last-keepalive.txt
+          git commit -m "chore: keepalive（${days} 天无提交）"
+          git push
